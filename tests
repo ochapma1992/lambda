@@ -1,0 +1,89 @@
+import pytest
+from datetime import datetime, timedelta, timezone
+from arti_archive import ArtiArchive
+
+def dt(days_offset):
+    """Helper to make UTC datetime offset from now."""
+    return datetime.now(timezone.utc) + timedelta(days=days_offset)
+
+def iso(dt_obj):
+    """Convert datetime to ISO string in the same format as artifacts."""
+    return dt_obj.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+@pytest.fixture
+def base_artifacts():
+    return [
+        {"name": "PkgA.1.0.0.nupkg", "stats": [{"downloaded": iso(dt(-10))}], "created": iso(dt(-20))},
+        {"name": "PkgA.2.0.0.nupkg", "stats": [{"downloaded": iso(dt(-40))}], "created": iso(dt(-50))},
+        {"name": "PkgB.1.0.0.nupkg", "stats": [], "created": iso(dt(-5))},
+        {"name": "PkgB.2.0.0.nupkg", "stats": [], "created": iso(dt(-60))},
+    ]
+
+def test_split_nuget_name_simple():
+    aa = ArtiArchive([], 30)
+    result = aa.split_nuget_name("MyLib.1.2.3.nupkg")
+    assert result == {"package": "MyLib", "version": "1.2.3"}
+
+def test_split_nuget_name_with_hyphen():
+    aa = ArtiArchive([], 30)
+    result = aa.split_nuget_name("MyLib.1.2.3-beta.nupkg")
+    assert result == {"package": "MyLib", "version": "1.2.3-beta"}
+
+def test_parse_ts_valid():
+    aa = ArtiArchive([], 30)
+    ts = "2025-08-14T12:00:00.000Z"
+    parsed = aa.parse_ts(ts)
+    assert parsed == datetime(2025, 8, 14, 12, 0, tzinfo=timezone.utc)
+
+def test_parse_ts_invalid():
+    aa = ArtiArchive([], 30)
+    assert aa.parse_ts("not-a-date") is None
+
+def test_best_download_ts_prefers_downloaded():
+    aa = ArtiArchive([], 30)
+    now_str = iso(dt(-1))
+    artifact = {"stats": [{"downloaded": now_str}], "created": iso(dt(-50))}
+    assert aa.best_download_ts(artifact) == aa.parse_ts(now_str)
+
+def test_best_download_ts_falls_back_to_created():
+    aa = ArtiArchive([], 30)
+    now_str = iso(dt(-3))
+    artifact = {"stats": [], "created": now_str}
+    assert aa.best_download_ts(artifact) == aa.parse_ts(now_str)
+
+def test_filter_old_artifacts_by_last_download_recent_and_old(base_artifacts):
+    # PkgA has a recent (10 days) and old (40 days) version → delete old only
+    aa = ArtiArchive(base_artifacts, 30)
+    to_delete = aa.filter_old_artifacts_by_last_download()
+    names = [a["name"] for a in to_delete]
+    assert "PkgA.2.0.0.nupkg" in names
+    assert "PkgA.1.0.0.nupkg" not in names  # kept
+
+def test_filter_old_artifacts_by_last_download_all_old():
+    # Both old, keep newest
+    arts = [
+        {"name": "PkgC.1.0.0.nupkg", "stats": [{"downloaded": iso(dt(-60))}], "created": iso(dt(-60))},
+        {"name": "PkgC.2.0.0.nupkg", "stats": [{"downloaded": iso(dt(-50))}], "created": iso(dt(-50))}
+    ]
+    aa = ArtiArchive(arts, 30)
+    to_delete = aa.filter_old_artifacts_by_last_download()
+    names = [a["name"] for a in to_delete]
+    assert "PkgC.1.0.0.nupkg" in names
+    assert "PkgC.2.0.0.nupkg" not in names  # kept newest old
+
+def test_filter_old_artifacts_by_last_download_keep_single():
+    arts = [{"name": "PkgD.1.0.0.nupkg", "stats": [], "created": iso(dt(-100))}]
+    aa = ArtiArchive(arts, 30)
+    assert aa.filter_old_artifacts_by_last_download() == []
+
+def test_never_downloaded_but_new_kept():
+    arts = [
+        {"name": "PkgE.1.0.0.nupkg", "stats": [], "created": iso(dt(-1))},
+        {"name": "PkgE.2.0.0.nupkg", "stats": [], "created": iso(dt(-60))}
+    ]
+    aa = ArtiArchive(arts, 30)
+    to_delete = aa.filter_old_artifacts_by_last_download()
+    names = [a["name"] for a in to_delete]
+    # Only old one should be deleted
+    assert "PkgE.2.0.0.nupkg" in names
+    assert "PkgE.1.0.0.nupkg" not in names
