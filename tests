@@ -1,89 +1,478 @@
+"""
+Test suite for Artifactory Archive and Cleanup operations.
+"""
+
 import pytest
-from datetime import datetime, timedelta, timezone
-from arti_archive import ArtiArchive
+import os
+from datetime import datetime, timezone, timedelta
+from unittest.mock import Mock, patch, MagicMock
+from collections import defaultdict
 
-def dt(days_offset):
-    """Helper to make UTC datetime offset from now."""
-    return datetime.now(timezone.utc) + timedelta(days=days_offset)
+# Import the classes we want to test
+# Assuming the main code is in a file called 'artifactory_manager.py'
+from artifactory_manager import (
+    Config,
+    NuGetPackageParser,
+    ArtifactoryClient,
+    ArchiveOperation,
+    CleanupOperation,
+    parse_time_string
+)
 
-def iso(dt_obj):
-    """Convert datetime to ISO string in the same format as artifacts."""
-    return dt_obj.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+class TestConfig:
+    """Tests for Configuration management."""
+    
+    def test_config_with_valid_env_vars(self):
+        """Test configuration with valid environment variables."""
+        with patch.dict(os.environ, {
+            'ARTIFACTORY_URL': 'https://artifactory.example.com/',
+            'ARTIFACTORY_TOKEN': 'test-token-123',
+            'MAX_WORKERS': '10'
+        }):
+            config = Config()
+            assert config.artifactory_url == 'https://artifactory.example.com/artifactory'
+            assert config.artifactory_token == 'test-token-123'
+            assert config.max_workers == 10
+    
+    def test_config_missing_url_raises_error(self):
+        """Test that missing ARTIFACTORY_URL raises ValueError."""
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError, match="ARTIFACTORY_URL environment variable is required"):
+                Config()
+    
+    def test_config_strips_trailing_slash(self):
+        """Test that trailing slashes are properly handled."""
+        with patch.dict(os.environ, {
+            'ARTIFACTORY_URL': 'https://artifactory.example.com///',
+            'ARTIFACTORY_TOKEN': 'test-token'
+        }):
+            config = Config()
+            assert config.artifactory_url == 'https://artifactory.example.com/artifactory'
+    
+    def test_config_vault_fallback(self):
+        """Test vault authentication fallback."""
+        with patch.dict(os.environ, {
+            'ARTIFACTORY_URL': 'https://artifactory.example.com',
+            'ARTIFACTORY_TOKEN_PATH': 'secret/artifactory'
+        }, clear=True):
+            with patch('artifactory_manager.get_vault_client') as mock_vault:
+                mock_client = Mock()
+                mock_client.read.return_value = {"data": {"token": "vault-token-123"}}
+                mock_vault.return_value = mock_client
+                
+                config = Config()
+                assert config.artifactory_token == 'vault-token-123'
+
+
+class TestNuGetPackageParser:
+    """Tests for NuGet package parsing utilities."""
+    
+    def test_parse_package_name_valid_package(self):
+        """Test parsing valid NuGet package names."""
+        parser = NuGetPackageParser()
+        
+        # Standard package
+        result = parser.parse_package_name("MyPackage.1.2.3.nupkg")
+        assert result == {"package": "MyPackage", "version": "1.2.3"}
+        
+        # Package with complex version
+        result = parser.parse_package_name("MyPackage.1.2.3-beta.1.nupkg")
+        assert result == {"package": "MyPackage", "version": "1.2.3-beta.1"}
+        
+        # Package with dots in name
+        result = parser.parse_package_name("My.Complex.Package.Name.2.1.0.nupkg")
+        assert result == {"package": "My.Complex.Package.Name", "version": "2.1.0"}
+    
+    def test_parse_package_name_invalid_package(self):
+        """Test parsing invalid package names."""
+        parser = NuGetPackageParser()
+        
+        result = parser.parse_package_name("invalid-filename.txt")
+        assert result == {"package": "invalid-filename.txt", "version": "unknown"}
+    
+    def test_parse_timestamp_valid_formats(self):
+        """Test parsing valid ISO timestamp formats."""
+        parser = NuGetPackageParser()
+        
+        # With microseconds
+        ts1 = parser.parse_timestamp("2024-01-15T14:30:45.123456Z")
+        expected1 = datetime(2024, 1, 15, 14, 30, 45, 123456, timezone.utc)
+        assert ts1 == expected1
+        
+        # Without microseconds
+        ts2 = parser.parse_timestamp("2024-01-15T14:30:45Z")
+        expected2 = datetime(2024, 1, 15, 14, 30, 45, 0, timezone.utc)
+        assert ts2 == expected2
+    
+    def test_parse_timestamp_invalid_format(self):
+        """Test parsing invalid timestamp formats."""
+        parser = NuGetPackageParser()
+        
+        assert parser.parse_timestamp("invalid-timestamp") is None
+        assert parser.parse_timestamp("") is None
+        assert parser.parse_timestamp(None) is None
+
+
+class TestArtifactoryClient:
+    """Tests for Artifactory client operations."""
+    
+    @pytest.fixture
+    def mock_config(self):
+        """Create a mock configuration."""
+        config = Mock()
+        config.artifactory_url = "https://artifactory.example.com/artifactory"
+        config.artifactory_token = "test-token"
+        config.max_workers = 5
+        return config
+    
+    @pytest.fixture
+    def client(self, mock_config):
+        """Create an ArtifactoryClient with mock config."""
+        return ArtifactoryClient(mock_config)
+    
+    @patch('artifactory_manager.requests.post')
+    def test_search_artifacts_success(self, mock_post, client):
+        """Test successful artifact search."""
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "results": [
+                {"name": "package1.1.0.0.nupkg", "path": ".", "created": "2024-01-01T00:00:00Z"},
+                {"name": "package2.2.0.0.nupkg", "path": "folder", "created": "2024-01-02T00:00:00Z"}
+            ]
+        }
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+        
+        results = client.search_artifacts("test-repo")
+        
+        assert len(results) == 2
+        assert results[0]["name"] == "package1.1.0.0.nupkg"
+        mock_post.assert_called_once()
+    
+    @patch('artifactory_manager.requests.post')
+    def test_search_artifacts_failure(self, mock_post, client):
+        """Test artifact search failure."""
+        mock_post.side_effect = Exception("Network error")
+        
+        with pytest.raises(Exception, match="Network error"):
+            client.search_artifacts("test-repo")
+    
+    @patch('artifactory_manager.requests.post')
+    def test_move_artifact_success(self, mock_post, client):
+        """Test successful artifact move."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+        
+        result = client.move_artifact("src-repo", ".", "test.nupkg", "dest-repo", dry_run=False)
+        
+        assert result is True
+        mock_post.assert_called_once()
+    
+    @patch('artifactory_manager.requests.post')
+    def test_move_artifact_dry_run(self, mock_post, client):
+        """Test artifact move in dry run mode."""
+        result = client.move_artifact("src-repo", ".", "test.nupkg", "dest-repo", dry_run=True)
+        
+        assert result is True
+        mock_post.assert_not_called()
+    
+    @patch('artifactory_manager.requests.delete')
+    def test_delete_artifact_success(self, mock_delete, client):
+        """Test successful artifact deletion."""
+        mock_response = Mock()
+        mock_response.status_code = 204
+        mock_delete.return_value = mock_response
+        
+        result = client.delete_artifact("test-repo", ".", "test.nupkg", dry_run=False)
+        
+        assert result is True
+        mock_delete.assert_called_once()
+    
+    @patch('artifactory_manager.requests.delete')
+    def test_delete_artifact_failure(self, mock_delete, client):
+        """Test artifact deletion failure."""
+        mock_response = Mock()
+        mock_response.status_code = 404
+        mock_response.text = "Not found"
+        mock_delete.return_value = mock_response
+        
+        result = client.delete_artifact("test-repo", ".", "test.nupkg", dry_run=False)
+        
+        assert result is False
+
+
+class TestArchiveOperation:
+    """Tests for Archive operation functionality."""
+    
+    @pytest.fixture
+    def mock_artifacts(self):
+        """Create mock artifact data for testing."""
+        now = datetime.now(timezone.utc)
+        old_date = now - timedelta(days=10)
+        recent_date = now - timedelta(days=1)
+        
+        return [
+            {
+                "name": "PackageA.1.0.0.nupkg",
+                "path": ".",
+                "created": old_date.isoformat() + "Z",
+                "stats": [{"downloaded": old_date.isoformat() + "Z"}]
+            },
+            {
+                "name": "PackageA.2.0.0.nupkg", 
+                "path": ".",
+                "created": recent_date.isoformat() + "Z",
+                "stats": [{"downloaded": recent_date.isoformat() + "Z"}]
+            },
+            {
+                "name": "PackageB.1.0.0.nupkg",
+                "path": ".",
+                "created": old_date.isoformat() + "Z",
+                "stats": []
+            }
+        ]
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    def test_archive_operation_init(self, mock_client_class, mock_config_class):
+        """Test ArchiveOperation initialization."""
+        mock_config = Mock()
+        mock_config.nuget_release = "nuget-release-local"
+        mock_config.nuget_archive = "nuget-release-archive"
+        mock_config_class.return_value = mock_config
+        
+        operation = ArchiveOperation(days=7, dry_run=True)
+        
+        assert operation.name == "ARCHIVE"
+        assert operation.cutoff_days == 7
+        assert operation.dry_run is True
+        assert operation.source_repo == "nuget-release-local"
+        assert operation.target_repo == "nuget-release-archive"
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    def test_filter_artifacts_for_archive(self, mock_client_class, mock_config_class, mock_artifacts):
+        """Test artifact filtering logic."""
+        mock_config_class.return_value = Mock()
+        operation = ArchiveOperation(days=5, dry_run=True)
+        
+        # Mock the parser to return proper package info
+        operation.parser = Mock()
+        operation.parser.parse_package_name.side_effect = [
+            {"package": "PackageA", "version": "1.0.0"},
+            {"package": "PackageA", "version": "2.0.0"},
+            {"package": "PackageB", "version": "1.0.0"}
+        ]
+        operation.parser.parse_timestamp.side_effect = lambda x: datetime.fromisoformat(x.replace('Z', '+00:00')) if x else None
+        
+        filtered = operation._filter_artifacts_for_archive(mock_artifacts)
+        
+        # Should archive PackageA.1.0.0 (old version of PackageA) 
+        # but keep PackageA.2.0.0 (recent) and PackageB.1.0.0 (only version)
+        assert len(filtered) == 1
+        assert filtered[0]["name"] == "PackageA.1.0.0.nupkg"
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    def test_categorize_versions(self, mock_client_class, mock_config_class, mock_artifacts):
+        """Test version categorization."""
+        mock_config_class.return_value = Mock()
+        operation = ArchiveOperation(days=5, dry_run=True)
+        operation.parser = NuGetPackageParser()
+        
+        recent, old = operation._categorize_versions(mock_artifacts)
+        
+        assert len(recent) == 1  # PackageA.2.0.0
+        assert len(old) == 2     # PackageA.1.0.0 and PackageB.1.0.0
+
+
+class TestCleanupOperation:
+    """Tests for Cleanup operation functionality."""
+    
+    @pytest.fixture
+    def mock_old_artifacts(self):
+        """Create mock old artifact data."""
+        old_date = datetime.now(timezone.utc) - timedelta(days=10)
+        recent_date = datetime.now(timezone.utc) - timedelta(days=1)
+        
+        return [
+            {
+                "name": "old-package.1.0.0.nupkg",
+                "path": ".",
+                "created": old_date.isoformat() + "Z"
+            },
+            {
+                "name": "recent-package.1.0.0.nupkg",
+                "path": ".",
+                "created": recent_date.isoformat() + "Z"
+            }
+        ]
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    def test_cleanup_operation_init(self, mock_client_class, mock_config_class):
+        """Test CleanupOperation initialization."""
+        mock_config = Mock()
+        mock_config.nuget_snapshot = "nuget-snapshot-local"
+        mock_config_class.return_value = mock_config
+        
+        operation = CleanupOperation(days=30, dry_run=False)
+        
+        assert operation.name == "CLEANUP"
+        assert operation.cutoff_days == 30
+        assert operation.dry_run is False
+        assert operation.target_repo == "nuget-snapshot-local"
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    def test_filter_old_artifacts(self, mock_client_class, mock_config_class, mock_old_artifacts):
+        """Test filtering of old artifacts."""
+        mock_config_class.return_value = Mock()
+        operation = CleanupOperation(days=5, dry_run=True)
+        operation.parser = NuGetPackageParser()
+        
+        old_artifacts = operation._filter_old_artifacts(mock_old_artifacts)
+        
+        assert len(old_artifacts) == 1
+        assert old_artifacts[0]["name"] == "old-package.1.0.0.nupkg"
+
+
+class TestUtilityFunctions:
+    """Tests for utility functions."""
+    
+    def test_parse_time_string_valid_formats(self):
+        """Test parsing valid time string formats."""
+        assert parse_time_string("4w") == 28    # 4 weeks = 28 days
+        assert parse_time_string("30d") == 30   # 30 days
+        assert parse_time_string("2m") == 60    # 2 months = 60 days
+        assert parse_time_string("15") == 15    # plain number = days
+    
+    def test_parse_time_string_invalid_formats(self):
+        """Test parsing invalid time string formats."""
+        assert parse_time_string("invalid") == 30  # default
+        assert parse_time_string("") == 30         # default
+        assert parse_time_string("4x") == 30       # invalid unit
+    
+    def test_parse_time_string_case_insensitive(self):
+        """Test that parsing is case insensitive."""
+        assert parse_time_string("4W") == 28
+        assert parse_time_string("30D") == 30
+        assert parse_time_string("2M") == 60
+
+
+class TestIntegration:
+    """Integration tests for complete workflows."""
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    @patch('artifactory_manager.ThreadPoolExecutor')
+    def test_archive_operation_complete_workflow(self, mock_executor, mock_client_class, mock_config_class):
+        """Test complete archive operation workflow."""
+        # Setup mocks
+        mock_config = Mock()
+        mock_config.nuget_release = "nuget-release-local"
+        mock_config.nuget_archive = "nuget-release-archive"
+        mock_config.max_workers = 5
+        mock_config_class.return_value = mock_config
+        
+        mock_client = Mock()
+        mock_client.search_artifacts.return_value = [
+            {
+                "name": "PackageA.1.0.0.nupkg",
+                "path": ".",
+                "created": (datetime.now(timezone.utc) - timedelta(days=10)).isoformat() + "Z",
+                "stats": []
+            }
+        ]
+        mock_client_class.return_value = mock_client
+        
+        # Mock ThreadPoolExecutor
+        mock_executor_instance = Mock()
+        mock_future = Mock()
+        mock_future.result.return_value = True
+        mock_executor_instance.submit.return_value = mock_future
+        mock_executor_instance.__enter__.return_value = mock_executor_instance
+        mock_executor_instance.__exit__.return_value = None
+        mock_executor.return_value = mock_executor_instance
+        
+        # Execute operation
+        operation = ArchiveOperation(days=5, dry_run=True)
+        operation.execute()
+        
+        # Verify calls
+        mock_client.search_artifacts.assert_called_once_with("nuget-release-local")
+    
+    @patch('artifactory_manager.Config')
+    @patch('artifactory_manager.ArtifactoryClient')
+    @patch('artifactory_manager.ThreadPoolExecutor')
+    def test_cleanup_operation_complete_workflow(self, mock_executor, mock_client_class, mock_config_class):
+        """Test complete cleanup operation workflow."""
+        # Setup mocks
+        mock_config = Mock()
+        mock_config.nuget_snapshot = "nuget-snapshot-local"
+        mock_config.max_workers = 5
+        mock_config_class.return_value = mock_config
+        
+        mock_client = Mock()
+        mock_client.search_artifacts.return_value = [
+            {
+                "name": "old-package.1.0.0.nupkg",
+                "path": ".",
+                "created": (datetime.now(timezone.utc) - timedelta(days=40)).isoformat() + "Z"
+            }
+        ]
+        mock_client_class.return_value = mock_client
+        
+        # Mock ThreadPoolExecutor
+        mock_executor_instance = Mock()
+        mock_future = Mock()
+        mock_future.result.return_value = True
+        mock_executor_instance.submit.return_value = mock_future
+        mock_executor_instance.__enter__.return_value = mock_executor_instance
+        mock_executor_instance.__exit__.return_value = None
+        mock_executor.return_value = mock_executor_instance
+        
+        # Execute operation
+        operation = CleanupOperation(days=30, dry_run=True)
+        operation.execute()
+        
+        # Verify calls
+        mock_client.search_artifacts.assert_called_once_with("nuget-snapshot-local")
+
+
+# Fixtures for common test data
+@pytest.fixture
+def sample_artifact():
+    """Sample artifact data for testing."""
+    return {
+        "name": "TestPackage.1.2.3.nupkg",
+        "path": ".",
+        "created": "2024-01-15T10:30:00.000000Z",
+        "stats": [{"downloaded": "2024-01-16T14:20:00.000000Z"}]
+    }
+
 
 @pytest.fixture
-def base_artifacts():
+def sample_artifacts_list():
+    """Sample list of artifacts with different ages."""
+    now = datetime.now(timezone.utc)
     return [
-        {"name": "PkgA.1.0.0.nupkg", "stats": [{"downloaded": iso(dt(-10))}], "created": iso(dt(-20))},
-        {"name": "PkgA.2.0.0.nupkg", "stats": [{"downloaded": iso(dt(-40))}], "created": iso(dt(-50))},
-        {"name": "PkgB.1.0.0.nupkg", "stats": [], "created": iso(dt(-5))},
-        {"name": "PkgB.2.0.0.nupkg", "stats": [], "created": iso(dt(-60))},
+        {
+            "name": "OldPackage.1.0.0.nupkg",
+            "path": ".",
+            "created": (now - timedelta(days=30)).isoformat() + "Z",
+            "stats": []
+        },
+        {
+            "name": "RecentPackage.1.0.0.nupkg", 
+            "path": ".",
+            "created": (now - timedelta(days=1)).isoformat() + "Z",
+            "stats": [{"downloaded": (now - timedelta(hours=2)).isoformat() + "Z"}]
+        }
     ]
 
-def test_split_nuget_name_simple():
-    aa = ArtiArchive([], 30)
-    result = aa.split_nuget_name("MyLib.1.2.3.nupkg")
-    assert result == {"package": "MyLib", "version": "1.2.3"}
 
-def test_split_nuget_name_with_hyphen():
-    aa = ArtiArchive([], 30)
-    result = aa.split_nuget_name("MyLib.1.2.3-beta.nupkg")
-    assert result == {"package": "MyLib", "version": "1.2.3-beta"}
-
-def test_parse_ts_valid():
-    aa = ArtiArchive([], 30)
-    ts = "2025-08-14T12:00:00.000Z"
-    parsed = aa.parse_ts(ts)
-    assert parsed == datetime(2025, 8, 14, 12, 0, tzinfo=timezone.utc)
-
-def test_parse_ts_invalid():
-    aa = ArtiArchive([], 30)
-    assert aa.parse_ts("not-a-date") is None
-
-def test_best_download_ts_prefers_downloaded():
-    aa = ArtiArchive([], 30)
-    now_str = iso(dt(-1))
-    artifact = {"stats": [{"downloaded": now_str}], "created": iso(dt(-50))}
-    assert aa.best_download_ts(artifact) == aa.parse_ts(now_str)
-
-def test_best_download_ts_falls_back_to_created():
-    aa = ArtiArchive([], 30)
-    now_str = iso(dt(-3))
-    artifact = {"stats": [], "created": now_str}
-    assert aa.best_download_ts(artifact) == aa.parse_ts(now_str)
-
-def test_filter_old_artifacts_by_last_download_recent_and_old(base_artifacts):
-    # PkgA has a recent (10 days) and old (40 days) version → delete old only
-    aa = ArtiArchive(base_artifacts, 30)
-    to_delete = aa.filter_old_artifacts_by_last_download()
-    names = [a["name"] for a in to_delete]
-    assert "PkgA.2.0.0.nupkg" in names
-    assert "PkgA.1.0.0.nupkg" not in names  # kept
-
-def test_filter_old_artifacts_by_last_download_all_old():
-    # Both old, keep newest
-    arts = [
-        {"name": "PkgC.1.0.0.nupkg", "stats": [{"downloaded": iso(dt(-60))}], "created": iso(dt(-60))},
-        {"name": "PkgC.2.0.0.nupkg", "stats": [{"downloaded": iso(dt(-50))}], "created": iso(dt(-50))}
-    ]
-    aa = ArtiArchive(arts, 30)
-    to_delete = aa.filter_old_artifacts_by_last_download()
-    names = [a["name"] for a in to_delete]
-    assert "PkgC.1.0.0.nupkg" in names
-    assert "PkgC.2.0.0.nupkg" not in names  # kept newest old
-
-def test_filter_old_artifacts_by_last_download_keep_single():
-    arts = [{"name": "PkgD.1.0.0.nupkg", "stats": [], "created": iso(dt(-100))}]
-    aa = ArtiArchive(arts, 30)
-    assert aa.filter_old_artifacts_by_last_download() == []
-
-def test_never_downloaded_but_new_kept():
-    arts = [
-        {"name": "PkgE.1.0.0.nupkg", "stats": [], "created": iso(dt(-1))},
-        {"name": "PkgE.2.0.0.nupkg", "stats": [], "created": iso(dt(-60))}
-    ]
-    aa = ArtiArchive(arts, 30)
-    to_delete = aa.filter_old_artifacts_by_last_download()
-    names = [a["name"] for a in to_delete]
-    # Only old one should be deleted
-    assert "PkgE.2.0.0.nupkg" in names
-    assert "PkgE.1.0.0.nupkg" not in names
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
