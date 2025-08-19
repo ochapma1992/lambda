@@ -186,6 +186,43 @@ class ArtifactoryClient:
         except requests.RequestException as e:
             logger.error(f"Error moving {src_path}: {e}")
             return False
+    
+    def delete_artifact(self, repo: str, path: str, name: str, dry_run: bool = True) -> bool:
+        """
+        Delete an artifact from a repository.
+        
+        Args:
+            repo: Repository name
+            path: Artifact path within repository
+            name: Artifact filename
+            dry_run: If True, log the operation without executing
+            
+        Returns:
+            True if deletion was successful, False otherwise
+        """
+        # Construct artifact path
+        if path == "." or not path:
+            artifact_path = f"{repo}/{name}"
+        else:
+            artifact_path = f"{repo}/{path}/{name}"
+        
+        delete_url = f"{self.config.artifactory_url}/{artifact_path}"
+        
+        if dry_run:
+            logger.info(f"DRY RUN: Would delete {artifact_path}")
+            return True
+        
+        try:
+            response = requests.delete(delete_url, headers=self.headers)
+            if response.status_code == 204:
+                logger.info(f"Successfully deleted {artifact_path}")
+                return True
+            else:
+                logger.error(f"Failed to delete {artifact_path}: {response.status_code} - {response.text}")
+                return False
+        except requests.RequestException as e:
+            logger.error(f"Error deleting {artifact_path}: {e}")
+            return False
 
 class ArtifactoryOperation(ABC):
     """Abstract base class for Artifactory operations."""
@@ -358,17 +395,153 @@ class ArchiveOperation(ArtifactoryOperation):
         failed = results.count(False)
         self.log(f"Archive completed: {successful} successful, {failed} failed")
 
+class CleanupOperation(ArtifactoryOperation):
+    """Operation to delete old NuGet packages from snapshot repository."""
+    
+    def __init__(self, days: int, dry_run: bool = True):
+        super().__init__("CLEANUP", days, dry_run)
+        self.target_repo = self.config.nuget_snapshot
+    
+    def execute(self) -> None:
+        """Execute the cleanup operation."""
+        self.log(f"Starting cleanup of {self.target_repo}")
+        self.log(f"Deleting artifacts older than {self.cutoff_days} days")
+        self.log(f"Dry run mode: {self.dry_run}")
+        
+        try:
+            # Get all artifacts from target repository
+            artifacts = self.client.search_artifacts(self.target_repo)
+            self.log(f"Found {len(artifacts)} total artifacts")
+            
+            # Filter artifacts older than cutoff date
+            old_artifacts = self._filter_old_artifacts(artifacts)
+            
+            if old_artifacts:
+                self.log(f"Found {len(old_artifacts)} artifacts to delete")
+                self._delete_artifacts_concurrent(old_artifacts)
+            else:
+                self.log("No old artifacts found for deletion")
+                
+        except Exception as e:
+            self.log(f"Cleanup operation failed: {e}", "error")
+            raise
+    
+    def _filter_old_artifacts(self, artifacts: List[Dict]) -> List[Dict]:
+        """
+        Filter artifacts that are older than the cutoff date.
+        
+        Args:
+            artifacts: List of artifact metadata
+            
+        Returns:
+            List of artifacts to delete
+        """
+        old_artifacts = []
+        
+        for artifact in artifacts:
+            # Use creation date as the primary filter criteria
+            created_str = artifact.get("created")
+            if not created_str:
+                self.log(f"No creation date for {artifact.get('name', 'unknown')}, skipping")
+                continue
+            
+            created_date = self.parser.parse_timestamp(created_str)
+            if created_date and created_date < self.cutoff:
+                old_artifacts.append(artifact)
+        
+        return old_artifacts
+    
+    def _delete_artifacts_concurrent(self, artifacts: List[Dict]) -> None:
+        """Delete artifacts using concurrent execution."""
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            futures = [
+                executor.submit(
+                    self.client.delete_artifact,
+                    self.target_repo,
+                    artifact["path"],
+                    artifact["name"],
+                    self.dry_run
+                )
+                for artifact in artifacts
+            ]
+            
+            results = [future.result() for future in as_completed(futures)]
+        
+        successful = results.count(True)
+        failed = results.count(False)
+        self.log(f"Cleanup completed: {successful} successful, {failed} failed")
+
+def parse_time_string(time_str: str) -> int:
+    """
+    Parse time string to days.
+    
+    Supports formats like: '4w' (4 weeks), '30d' (30 days), '2m' (2 months)
+    
+    Args:
+        time_str: Time string to parse
+        
+    Returns:
+        Number of days
+    """
+    if not time_str:
+        return 30  # Default to 30 days
+    
+    time_str = time_str.lower().strip()
+    
+    # Extract number and unit
+    if time_str[-1] in ['d', 'w', 'm']:
+        try:
+            number = int(time_str[:-1])
+            unit = time_str[-1]
+            
+            if unit == 'd':  # days
+                return number
+            elif unit == 'w':  # weeks
+                return number * 7
+            elif unit == 'm':  # months (approximate)
+                return number * 30
+        except ValueError:
+            pass
+    
+    # Try parsing as plain number (assume days)
+    try:
+        return int(time_str)
+    except ValueError:
+        logger.warning(f"Could not parse time string '{time_str}', defaulting to 30 days")
+        return 30
+
 def main():
     """Main entry point for the archive operation."""
     # Archive artifacts older than 1 day (can be configured)
     archive_days = int(os.getenv("ARCHIVE_DAYS", "1"))
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     
+    # Parse cleanup time from TIME environment variable
+    time_str = os.getenv("TIME", "4w")
+    cleanup_days = parse_time_string(time_str)
+    
+    operation_type = os.getenv("OPERATION", "archive").lower()
+    
     try:
-        operation = ArchiveOperation(days=archive_days, dry_run=dry_run)
-        operation.execute()
+        if operation_type == "archive":
+            operation = ArchiveOperation(days=archive_days, dry_run=dry_run)
+            operation.execute()
+        elif operation_type == "cleanup":
+            operation = CleanupOperation(days=cleanup_days, dry_run=dry_run)
+            operation.execute()
+        elif operation_type == "both":
+            # Run archive first, then cleanup
+            archive_op = ArchiveOperation(days=archive_days, dry_run=dry_run)
+            archive_op.execute()
+            
+            cleanup_op = CleanupOperation(days=cleanup_days, dry_run=dry_run)
+            cleanup_op.execute()
+        else:
+            logger.error(f"Unknown operation type: {operation_type}. Use 'archive', 'cleanup', or 'both'")
+            raise ValueError(f"Invalid operation type: {operation_type}")
+            
     except Exception as e:
-        logger.error(f"Archive operation failed: {e}")
+        logger.error(f"Operation failed: {e}")
         raise
 
 if __name__ == "__main__":
