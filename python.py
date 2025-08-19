@@ -1,3 +1,10 @@
+"""
+Artifactory NuGet Package Archive Manager
+
+This module provides functionality to archive old NuGet packages from release
+repositories to archive repositories based on age and download activity.
+"""
+
 import re
 import requests
 import os
@@ -5,180 +12,364 @@ from collections import defaultdict
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
+import logging
 
-ARTIFACTORY_URL = os.environ["ARTIFACTORY_URL"].rstrip("/")+"/artifactory"
-ARTIFACTORY_TOKEN = os.getenv("ARTIFACTORY_TOKEN")
-TIME = os.getenv("TIME", "4w")
-DOWNLOAD_TIME = os.getenv("DOWNLOAD_TIME", "")
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-NUGET_SNAPSHOT = "nuget-snapshot-local"
-NUGET_RELEASE = "nuget-release-local"
-NUGET_ARCHIVE = "nuget-release-archive"
+class Config:
+    """Configuration management for Artifactory operations."""
+    
+    def __init__(self):
+        self.artifactory_url = self._get_artifactory_url()
+        self.artifactory_token = self._get_artifactory_token()
+        self.default_time = os.getenv("TIME", "4w")
+        self.download_time = os.getenv("DOWNLOAD_TIME", "")
+        self.max_workers = int(os.getenv("MAX_WORKERS", "5"))
+        
+        # Repository names
+        self.nuget_snapshot = "nuget-snapshot-local"
+        self.nuget_release = "nuget-release-local"
+        self.nuget_archive = "nuget-release-archive"
+    
+    def _get_artifactory_url(self) -> str:
+        """Get and format Artifactory URL."""
+        base_url = os.environ.get("ARTIFACTORY_URL")
+        if not base_url:
+            raise ValueError("ARTIFACTORY_URL environment variable is required")
+        return base_url.rstrip("/") + "/artifactory"
+    
+    def _get_artifactory_token(self) -> str:
+        """Get Artifactory token from environment or vault."""
+        token = os.getenv("ARTIFACTORY_TOKEN")
+        if token:
+            return token
+            
+        # Fallback to vault authentication
+        try:
+            from arti_cleanup.auth import get_vault_client
+            token_path = os.environ.get("ARTIFACTORY_TOKEN_PATH")
+            if not token_path:
+                raise ValueError("Either ARTIFACTORY_TOKEN or ARTIFACTORY_TOKEN_PATH must be set")
+            
+            logger.info("No direct token provided, attempting vault authentication")
+            vault = get_vault_client()
+            return vault.read(token_path)["data"]["token"]
+        except ImportError:
+            raise ValueError("Vault authentication module not available and no direct token provided")
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
+class NuGetPackageParser:
+    """Utility class for parsing NuGet package information."""
+    
+    # Regex pattern for NuGet package naming convention
+    NUGET_PATTERN = re.compile(r"^(.*?)\.((?:\d+\.){2,}\d+(?:[-+][0-9A-Za-z\.\-]+)?)\.nupkg$")
+    
+    # ISO timestamp formats supported by Artifactory
+    ISO_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")
+    
+    @classmethod
+    def parse_package_name(cls, filename: str) -> Dict[str, str]:
+        """
+        Parse NuGet package filename to extract package ID and version.
+        
+        Args:
+            filename: NuGet package filename (e.g., 'MyPackage.1.2.3.nupkg')
+            
+        Returns:
+            Dictionary with 'package' and 'version' keys
+        """
+        match = cls.NUGET_PATTERN.match(filename)
+        if match:
+            return {
+                "package": match.group(1),
+                "version": match.group(2)
+            }
+        return {"package": filename, "version": "unknown"}
+    
+    @classmethod
+    def parse_timestamp(cls, timestamp_str: Optional[str]) -> Optional[datetime]:
+        """
+        Parse ISO timestamp string to datetime object.
+        
+        Args:
+            timestamp_str: ISO format timestamp string
+            
+        Returns:
+            Parsed datetime object or None if parsing fails
+        """
+        if not timestamp_str:
+            return None
+            
+        for fmt in cls.ISO_FORMATS:
+            try:
+                return datetime.strptime(timestamp_str, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        
+        logger.warning(f"Failed to parse timestamp: {timestamp_str}")
+        return None
 
-ISO_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")
-
-if not ARTIFACTORY_TOKEN:
-    from arti_cleanup.auth import *
-    ARTIFACTORY_TOKEN_PATH = os.environ["ARTIFACTORY_TOKEN_PATH"]
-    print("No Token was provided, will attempt to check in Vault")
-    vault = get_vault_client()
-    ARTIFACTORY_TOKEN = vault.read(ARTIFACTORY_TOKEN_PATH)["data"]["token"]
-
-HEADER = {"content-type": "text/plain", "X-JFrog-Art-Api": ARTIFACTORY_TOKEN}
+class ArtifactoryClient:
+    """Client for interacting with Artifactory REST API."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.headers = {
+            "content-type": "text/plain",
+            "X-JFrog-Art-Api": config.artifactory_token
+        }
+    
+    def search_artifacts(self, repository: str) -> List[Dict]:
+        """
+        Search for artifacts in a repository using AQL.
+        
+        Args:
+            repository: Repository name to search in
+            
+        Returns:
+            List of artifact metadata dictionaries
+        """
+        query = (
+            f'items.find({{"repo":"{repository}"}}).'
+            'include("name", "path", "created", "stat.downloaded", "stat.downloads")'
+        )
+        
+        try:
+            response = requests.post(
+                f"{self.config.artifactory_url}/api/search/aql",
+                data=query,
+                headers=self.headers
+            )
+            response.raise_for_status()
+            return response.json().get("results", [])
+        except requests.RequestException as e:
+            logger.error(f"Failed to search artifacts in {repository}: {e}")
+            raise
+    
+    def move_artifact(self, src_repo: str, path: str, name: str, dest_repo: str, dry_run: bool = True) -> bool:
+        """
+        Move an artifact from source to destination repository.
+        
+        Args:
+            src_repo: Source repository name
+            path: Artifact path within repository
+            name: Artifact filename
+            dest_repo: Destination repository name
+            dry_run: If True, log the operation without executing
+            
+        Returns:
+            True if move was successful, False otherwise
+        """
+        # Construct source path
+        if path == "." or not path:
+            src_path = f"{src_repo}/{name}"
+        else:
+            src_path = f"{src_repo}/{path}/{name}"
+        
+        dest_path = src_path.replace(src_repo, dest_repo)
+        move_url = f"{self.config.artifactory_url}/api/move/{src_path}?to=/{dest_path}"
+        
+        if dry_run:
+            logger.info(f"DRY RUN: Would move {src_path} to {dest_path}")
+            return True
+        
+        try:
+            response = requests.post(move_url, headers=self.headers)
+            if response.status_code == 200:
+                logger.info(f"Successfully moved {src_path} to {dest_path}")
+                return True
+            else:
+                logger.error(f"Failed to move {src_path}: {response.status_code} - {response.text}")
+                return False
+        except requests.RequestException as e:
+            logger.error(f"Error moving {src_path}: {e}")
+            return False
 
 class ArtifactoryOperation(ABC):
-    def __init__(self, name, days, test = True):
-        self.test = test
+    """Abstract base class for Artifactory operations."""
+    
+    def __init__(self, name: str, days: int, dry_run: bool = True):
         self.name = name
         self.cutoff_days = days
         self.cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
+        self.dry_run = dry_run
+        self.config = Config()
+        self.client = ArtifactoryClient(self.config)
+        self.parser = NuGetPackageParser()
+    
     @abstractmethod
-    def execute(self):
+    def execute(self) -> None:
+        """Execute the operation."""
         pass
-
-    def log(self, message):
-        print(f"[{self.name}] {message}")
-
-    def _get_artifacts_from_repo(self, repository):
-        query = '''items.find({ "repo":"''' + repository + '''"}).include("name", "path", "created", "stat.downloaded", "stat.downloads")'''
-        response = requests.post(f"{ARTIFACTORY_URL}/api/search/aql", data=query, headers=HEADER)
-        response.raise_for_status()
-        return response.json().get("results", [])
-
+    
+    def log(self, message: str, level: str = "info") -> None:
+        """Log a message with operation context."""
+        getattr(logger, level)(f"[{self.name}] {message}")
 
 class ArchiveOperation(ArtifactoryOperation):
-    def __init__(self, days):
-        super().__init__("ARCHIVE", days)
-        self.source_repo = NUGET_RELEASE
-        self.target_repo = NUGET_ARCHIVE
-
-    def execute(self):
+    """Operation to archive old NuGet packages from release to archive repository."""
+    
+    def __init__(self, days: int, dry_run: bool = True):
+        super().__init__("ARCHIVE", days, dry_run)
+        self.source_repo = self.config.nuget_release
+        self.target_repo = self.config.nuget_archive
+    
+    def execute(self) -> None:
+        """Execute the archive operation."""
         self.log(f"Starting archive from {self.source_repo} to {self.target_repo}")
         self.log(f"Archiving artifacts older than {self.cutoff_days} days")
-
-        artifacts = self._get_artifacts_from_repo(self.source_repo)
-
-        # Filter artifacts older than cutoff date
-        old_artifacts = self._filter_old_artifacts(artifacts, self.cutoff)
-
-        if len(old_artifacts) > 0:
-            self._move_artifacts_threaded(old_artifacts)
-            self.log(f"Finished archiving")
-        else:
-            self.log(f"There were no artifacts to archive")
-
-
-    def _split_nuget_name(self, artifact):
-        match = re.match(r"^(.*?)\.((?:\d+\.){2,}\d+(?:[-+][0-9A-Za-z\.\-]+)?)\.nupkg$", artifact)
-        if match:
-            package_id = match.group(1)
-            version = match.group(2)
-            return {"package": package_id, "version": version}
-        return {"package": artifact, "version": "none"}
-
-    def _parse_ts(self, ts: str | None):
-        if not ts:
-            return None
-        for fmt in ISO_FORMATS:
-            try:
-                return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
-            except ValueError:
+        self.log(f"Dry run mode: {self.dry_run}")
+        
+        try:
+            # Get all artifacts from source repository
+            artifacts = self.client.search_artifacts(self.source_repo)
+            self.log(f"Found {len(artifacts)} total artifacts")
+            
+            # Filter artifacts that should be archived
+            artifacts_to_archive = self._filter_artifacts_for_archive(artifacts)
+            
+            if artifacts_to_archive:
+                self.log(f"Found {len(artifacts_to_archive)} artifacts to archive")
+                self._archive_artifacts_concurrent(artifacts_to_archive)
+            else:
+                self.log("No artifacts found for archiving")
+                
+        except Exception as e:
+            self.log(f"Archive operation failed: {e}", "error")
+            raise
+    
+    def _filter_artifacts_for_archive(self, artifacts: List[Dict]) -> List[Dict]:
+        """
+        Filter artifacts that should be archived based on age and download activity.
+        
+        Strategy:
+        - Group artifacts by package name
+        - For each package, keep the most recently downloaded/created version
+        - Archive older versions that haven't been downloaded recently
+        
+        Args:
+            artifacts: List of artifact metadata
+            
+        Returns:
+            List of artifacts to archive
+        """
+        # Parse package information for each artifact
+        for artifact in artifacts:
+            package_info = self.parser.parse_package_name(artifact["name"])
+            artifact.update(package_info)
+        
+        # Group artifacts by package name
+        packages = defaultdict(list)
+        for artifact in artifacts:
+            packages[artifact["package"]].append(artifact)
+        
+        artifacts_to_archive = []
+        
+        for package_name, versions in packages.items():
+            if len(versions) <= 1:
+                self.log(f"Skipping {package_name}: only one version available")
                 continue
-        return None
-
-
-    def _best_download_ts(self, item: dict) -> datetime | None:
-        stats = item.get("stats", [])
+            
+            # Sort versions by download activity (most recent first)
+            versions.sort(key=self._get_sort_key, reverse=True)
+            
+            # Categorize versions as recent or old
+            recent_versions, old_versions = self._categorize_versions(versions)
+            
+            if recent_versions:
+                # Keep recent versions, archive all old ones
+                artifacts_to_archive.extend(old_versions)
+                self.log(f"{package_name}: Keeping {len(recent_versions)} recent, archiving {len(old_versions)} old")
+            elif len(old_versions) > 1:
+                # No recent activity, but keep the newest old version
+                artifacts_to_archive.extend(old_versions[1:])
+                self.log(f"{package_name}: No recent activity, keeping newest, archiving {len(old_versions)-1} old")
+        
+        return artifacts_to_archive
+    
+    def _categorize_versions(self, versions: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Categorize versions as recent or old based on download activity."""
+        recent_versions = []
+        old_versions = []
+        
+        for version in versions:
+            last_activity = self._get_last_activity_timestamp(version)
+            if last_activity and last_activity >= self.cutoff:
+                recent_versions.append(version)
+            else:
+                old_versions.append(version)
+        
+        return recent_versions, old_versions
+    
+    def _get_last_activity_timestamp(self, artifact: Dict) -> Optional[datetime]:
+        """Get the most recent activity timestamp (download or creation)."""
+        # Check download timestamp first
+        stats = artifact.get("stats", [])
         if stats:
             downloaded_str = stats[0].get("downloaded")
             if downloaded_str:
-                return self._parse_ts(downloaded_str)
-
-        created_str = item.get("created")
+                download_ts = self.parser.parse_timestamp(downloaded_str)
+                if download_ts:
+                    return download_ts
+        
+        # Fall back to creation timestamp
+        created_str = artifact.get("created")
         if created_str:
-            return self._parse_ts(created_str)
-
-
-    def _created_ts(self, item: dict) -> datetime | None:
-        return self._parse_ts(item.get("created"))
-
-    def _sort_key(self, item: dict):
+            return self.parser.parse_timestamp(created_str)
+        
+        return None
+    
+    def _get_sort_key(self, artifact: Dict) -> Tuple[datetime, datetime]:
         """
-        Sort newest-first using:
-          1) last_downloaded_dt (None -> oldest)
-          2) created as a last resort
+        Generate sort key for artifacts (newest first).
+        
+        Returns tuple of (last_download_time, creation_time) with epoch fallback
         """
-        ld = self._best_download_ts(item)
-        cr = self._created_ts(item)
-
+        epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+        
+        last_activity = self._get_last_activity_timestamp(artifact)
+        created = self.parser.parse_timestamp(artifact.get("created"))
+        
         return (
-            ld or datetime.fromtimestamp(0, tz=timezone.utc),
-            cr or datetime.fromtimestamp(0, tz=timezone.utc),
+            last_activity or epoch,
+            created or epoch
         )
-
-    def _filter_old_artifacts(self, artifacts, cutoff):
-
-        for art in artifacts:
-            art["package"] = self._split_nuget_name(art["name"])["package"]
-            art["version"] = self._split_nuget_name(art["name"])["version"]
-
-        grouped = defaultdict(list)
-        for art in artifacts:
-            grouped[art["package"]].append(art)
-
-        to_delete: list[dict] = []
-
-        for pkg, versions in grouped.items():
-            if len(versions) <= 1:
-                continue  # if theres only one, just leave it
-
-            versions.sort(key=lambda x: self._sort_key(x), reverse=True)
-            recent = []
-            old = []
-            for v in versions:
-                ld = self._best_download_ts(v)
-                if ld and ld >= cutoff:
-                    recent.append(v)
-                else:
-                    old.append(v)
-
-            if recent:
-                # We have at least one "fresh" version → delete all old
-                to_delete.extend(old)
-            else:
-                # No fresh versions → keep the newest old (versions already sorted desc)
-                if len(old) > 1:
-                    to_delete.extend(old[1:])
-
-        return to_delete
-
-    def _move_artifact(self, src_repo, path, name, dest_repo):
-            if path == ".":
-                src = f"{src_repo}/{name}"
-            else:
-                src = f"{src_repo}/{path}/{name}" if path else f"{src_repo}/{name}"
-            dest = src.replace(src_repo, dest_repo)
-            move_url = f"{ARTIFACTORY_URL}/api/move/{src}?to=/{dest}"
-            if self.test:
-                self.log(f'Faking the move {move_url}')
-                return True
-            else:
-                response = requests.post(move_url, headers=HEADER)
-                self.log(response.json())
-                return response.status_code == 200
-
-    def _move_artifacts_threaded(self, artifacts):
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    
+    def _archive_artifacts_concurrent(self, artifacts: List[Dict]) -> None:
+        """Archive artifacts using concurrent execution."""
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             futures = [
-                executor.submit(self._move_artifact,self.source_repo, artifact["path"], artifact["name"], self.target_repo)
+                executor.submit(
+                    self.client.move_artifact,
+                    self.source_repo,
+                    artifact["path"],
+                    artifact["name"],
+                    self.target_repo,
+                    self.dry_run
+                )
                 for artifact in artifacts
             ]
-            results = [f.result() for f in as_completed(futures)]
-        self.log(f"Moved: {results.count(True)}. Failed: {results.count(False)}")
+            
+            results = [future.result() for future in as_completed(futures)]
+        
+        successful = results.count(True)
+        failed = results.count(False)
+        self.log(f"Archive completed: {successful} successful, {failed} failed")
 
+def main():
+    """Main entry point for the archive operation."""
+    # Archive artifacts older than 1 day (can be configured)
+    archive_days = int(os.getenv("ARCHIVE_DAYS", "1"))
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    
+    try:
+        operation = ArchiveOperation(days=archive_days, dry_run=dry_run)
+        operation.execute()
+    except Exception as e:
+        logger.error(f"Archive operation failed: {e}")
+        raise
 
-archive_op = ArchiveOperation(1)
-archive_op.execute()
+if __name__ == "__main__":
+    main()
