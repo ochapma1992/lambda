@@ -1,0 +1,199 @@
+import json
+import boto3
+import requests
+from requests.auth import HTTPBasicAuth
+import os
+import urllib.parse
+from typing import Dict, Any, Tuple
+
+# Environment variables for Artifactory configuration
+ARTIFACTORY_BASE_URL = os.environ.get('ARTIFACTORY_BASE_URL', 'https://your-artifactory.com/artifactory')
+ARTIFACTORY_USERNAME = os.environ.get('ARTIFACTORY_USERNAME')
+ARTIFACTORY_PASSWORD = os.environ.get('ARTIFACTORY_PASSWORD')
+SOURCE_REPO = 'nuget-release-archive'
+TARGET_REPO = 'nuget-release-local'
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Lambda handler for moving NuGet packages from archive to local repository
+    
+    Expected POST body:
+    {
+        "packageName": "MyPackage",
+        "version": "1.0.0"
+    }
+    """
+    
+    try:
+        # Parse the request body
+        if 'body' not in event:
+            return create_error_response(400, "Missing request body")
+        
+        # Handle both string and already-parsed JSON
+        if isinstance(event['body'], str):
+            body = json.loads(event['body'])
+        else:
+            body = event['body']
+        
+        # Validate required parameters
+        package_name = body.get('packageName')
+        version = body.get('version')
+        
+        if not package_name or not version:
+            return create_error_response(400, "Missing required parameters: packageName and version")
+        
+        # Validate environment variables
+        if not ARTIFACTORY_USERNAME or not ARTIFACTORY_PASSWORD:
+            return create_error_response(500, "Artifactory credentials not configured")
+        
+        # Check if package exists in source repository
+        package_exists, package_path = check_package_exists(package_name, version)
+        
+        if not package_exists:
+            return create_error_response(404, f"Package {package_name} version {version} not found in {SOURCE_REPO}")
+        
+        # Move the package to target repository
+        move_success, move_message = move_package(package_path, package_name, version)
+        
+        if move_success:
+            return create_success_response({
+                "message": f"Successfully moved {package_name} {version} from {SOURCE_REPO} to {TARGET_REPO}",
+                "packageName": package_name,
+                "version": version,
+                "sourcePath": package_path,
+                "targetRepo": TARGET_REPO
+            })
+        else:
+            return create_error_response(500, f"Failed to move package: {move_message}")
+    
+    except json.JSONDecodeError:
+        return create_error_response(400, "Invalid JSON in request body")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        return create_error_response(500, f"Internal server error: {str(e)}")
+
+def check_package_exists(package_name: str, version: str) -> Tuple[bool, str]:
+    """
+    Check if a NuGet package exists in the source repository
+    
+    Returns:
+        Tuple[bool, str]: (exists, package_path)
+    """
+    
+    # NuGet package path format: packagename/version/packagename.version.nupkg
+    package_path = f"{package_name.lower()}/{version}/{package_name}.{version}.nupkg"
+    
+    # Artifactory REST API endpoint to check if file exists
+    url = f"{ARTIFACTORY_BASE_URL}/{SOURCE_REPO}/{package_path}"
+    
+    auth = HTTPBasicAuth(ARTIFACTORY_USERNAME, ARTIFACTORY_PASSWORD)
+    
+    try:
+        response = requests.head(url, auth=auth, timeout=30)
+        
+        if response.status_code == 200:
+            print(f"Package found: {package_path}")
+            return True, package_path
+        elif response.status_code == 404:
+            print(f"Package not found: {package_path}")
+            return False, package_path
+        else:
+            print(f"Unexpected response when checking package existence: {response.status_code}")
+            return False, package_path
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Error checking package existence: {str(e)}")
+        return False, package_path
+
+def move_package(package_path: str, package_name: str, version: str) -> Tuple[bool, str]:
+    """
+    Move package from source to target repository using Artifactory move API
+    
+    Returns:
+        Tuple[bool, str]: (success, message)
+    """
+    
+    # Artifactory Move API endpoint
+    move_url = f"{ARTIFACTORY_BASE_URL}/api/move/{SOURCE_REPO}/{package_path}"
+    
+    # Target path (same structure in target repo)
+    target_path = f"{TARGET_REPO}/{package_path}"
+    
+    # Parameters for move operation
+    params = {
+        'to': f"/{target_path}",
+        'dry': 0,  # Set to 1 for dry run
+        'suppressLayouts': 0,
+        'failFast': 1
+    }
+    
+    auth = HTTPBasicAuth(ARTIFACTORY_USERNAME, ARTIFACTORY_PASSWORD)
+    
+    try:
+        response = requests.post(move_url, params=params, auth=auth, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            messages = result.get('messages', [])
+            
+            # Check if move was successful
+            success_messages = [msg for msg in messages if 'moved' in msg.get('message', '').lower()]
+            
+            if success_messages:
+                print(f"Successfully moved package: {package_name} {version}")
+                return True, f"Package moved successfully: {success_messages[0]['message']}"
+            else:
+                print(f"Move operation completed but no success message found: {messages}")
+                return False, f"Move operation unclear: {messages}"
+                
+        else:
+            error_msg = f"Move API returned status {response.status_code}: {response.text}"
+            print(error_msg)
+            return False, error_msg
+            
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Error during move operation: {str(e)}"
+        print(error_msg)
+        return False, error_msg
+
+def create_success_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a successful API response"""
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+        },
+        'body': json.dumps(data)
+    }
+
+def create_error_response(status_code: int, message: str) -> Dict[str, Any]:
+    """Create an error API response"""
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+        },
+        'body': json.dumps({
+            'error': message,
+            'statusCode': status_code
+        })
+    }
+
+# For local testing
+if __name__ == "__main__":
+    # Test event
+    test_event = {
+        'body': json.dumps({
+            'packageName': 'TestPackage',
+            'version': '1.0.0'
+        })
+    }
+    
+    result = lambda_handler(test_event, None)
+    print(json.dumps(result, indent=2))
